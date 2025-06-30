@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # Main RAG API Service
+  rag-api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"  # Fixed port consistency
+    environment:
+      - FLASK_ENV=production
+      - FLASK_RUN_PORT=5001
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SITE24X7_API_KEY=${SITE24X7_API_KEY:-in_24be7e829d6ca9b6dd72ca278c32e2bf}
+      - REDIS_URL=redis://redis:6379
+      - SECRET_KEY=${SECRET_KEY:-change-me-in-production}
+      - OTLP_ENDPOINT=http://otel-collector:4318
+    volumes:
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+      - ./vector_data:/app/vector_data
+      - ./metrics.db:/app/metrics.db  # Share metrics DB
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    networks:
+      - rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - rag-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./telemetry/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"  # OTLP gRPC receiver
+      - "4318:4318"  # OTLP HTTP receiver
+      - "8888:8889"  # Collector metrics endpoint
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.site24x7rum.in
+      - OTEL_EXPORTER_OTLP_HEADERS=api-key=in_24be7e829d6ca9b6dd72ca278c32e2bf
+    restart: unless-stopped
+    networks:
+      - rag-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8889/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Site24x7 Reporter
+  site24x7-reporter:
+    build:
+      context: ./telemetry
+      dockerfile: Dockerfile.reporter
+    container_name: site24x7-reporter
+    environment:
+      - SITE24X7_API_KEY=${SITE24X7_API_KEY:-in_24be7e829d6ca9b6dd72ca278c32e2bf}
+      - SITE24X7_APP_KEY=${SITE24X7_APP_KEY:-e5b0f39bd1c6a990b6ca6ef78104bff7}
+      - SITE24X7_LICENSE_KEY=${SITE24X7_LICENSE_KEY:-in_24be7e829d6ca9b6dd72ca278c32e2bf}
+    volumes:
+      - ./metrics.db:/app/metrics.db:ro  # Read-only access to metrics DB
+    restart: unless-stopped
+    depends_on:
+      - rag-api
+      - otel-collector
+    networks:
+      - rag-network
+
+  # Prometheus (Optional - for local metrics)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  prometheus_data:
+
+networks:
+  rag-network:
+    driver: bridge
